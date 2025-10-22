@@ -1,0 +1,26 @@
+{
+  "name": "demo-access-service",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "nodemailer": "^7.0.3",
+    "pg": "^8.16.3",
+    "uuid": "^11.1.0",
+    "VoiceThru-Order": "file:.."
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/nodemailer": "^6.4.17",
+    "@types/pg": "^8.15.5",
+    "@types/uuid": "^10.0.0",
+    "@vercel/node": "^3.2.16",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=18.17"
+  }
+}
