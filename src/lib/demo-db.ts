@@ -1,4 +1,4 @@
-import { Pool, PoolClient } from 'pg';
+import { Pool } from 'pg';
 
 const connectionString =
   process.env.DEMO_DATABASE_URL ||
@@ -11,41 +11,6 @@ const pool = connectionString
       connectionString,
       ssl: { rejectUnauthorized: false },
     })
-  : null;
-
-async function initializeDemoConstraints(client: PoolClient) {
-  await client.query(`
-    CREATE TABLE IF NOT EXISTS demo_constraints (
-      id SERIAL PRIMARY KEY,
-      conversation_timer INTERVAL NULL,
-      conversations_allowed INTEGER NULL,
-      token_expiry INTERVAL NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  await client.query(
-    `
-    INSERT INTO demo_constraints (conversation_timer, conversations_allowed, token_expiry)
-    SELECT $1::INTERVAL, $2::INTEGER, $3::INTERVAL
-    WHERE NOT EXISTS (SELECT 1 FROM demo_constraints)
-    `,
-    ['3 minutes', 3, '7 days'],
-  );
-}
-
-const constraintsInitialization: Promise<void> | null = pool
-  ? (async () => {
-      const client = await pool.connect();
-      try {
-        await initializeDemoConstraints(client);
-      } catch (error) {
-        console.error('[DemoAccessService] Failed to initialize demo_constraints table:', error);
-      } finally {
-        client.release();
-      }
-    })()
   : null;
 
 function requirePool() {
@@ -64,10 +29,6 @@ export type DemoConstraintsRow = {
 
 export async function getDemoConstraints(): Promise<DemoConstraintsRow | null> {
   const activePool = requirePool();
-  if (constraintsInitialization) {
-    await constraintsInitialization;
-  }
-
   const client = await activePool.connect();
 
   try {
@@ -84,6 +45,12 @@ export async function getDemoConstraints(): Promise<DemoConstraintsRow | null> {
       `,
     );
     return result.rows[0] ?? null;
+  } catch (error) {
+    if ((error as { code?: string })?.code === '42P01') {
+      console.warn('[DemoAccessService] demo_constraints table not found; falling back to defaults.');
+      return null;
+    }
+    throw error;
   } finally {
     client.release();
   }
