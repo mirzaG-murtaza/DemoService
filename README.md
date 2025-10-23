@@ -1,6 +1,6 @@
 # Demo Access Service
 
-Self-contained Node service that manages demo-access tokens, email delivery, Supabase synchronisation, and Neon/Postgres persistence. It exposes lightweight HTTP endpoints so the main VoiceThru application (or any other client) can request, validate, and log usage of demo tokens over the network.
+Self-contained Node service that manages demo-access tokens, email delivery, and Neon/Postgres persistence. It exposes lightweight HTTP endpoints so the main VoiceThru application (or any other client) can request, validate, and log usage of demo tokens over the network.
 
 ## Endpoints
 
@@ -61,8 +61,6 @@ Content-Type: application/json
 | `EMAIL_USER` / `SMTP_USER` | SMTP username |
 | `EMAIL_PASSWORD` / `SMTP_PASSWORD` | SMTP password |
 | `DEMO_DATABASE_URL` / `NEON_DATABASE_URL` / `DATABASE_URL` / `POSTGRES_URL` | Connection string for the Neon/Postgres demo database |
-| `SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_URL` | Supabase project URL |
-| `SUPABASE_SERVICE_ROLE_KEY` / `SUPABASE_ANON_KEY` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Supabase credentials (service-role is preferred on the server) |
 
 Set these in Vercel under **Project Settings -> Environment Variables** before deploying.
 
@@ -99,5 +97,4 @@ await fetch(`${process.env.DEMO_SERVICE_URL}/api/demo/request`, {
 ## Troubleshooting
 
 - **Email not sending**: Ensure SMTP credentials are present. If omitted, the service will skip sending but still succeed, returning `emailSent: true` only when the transporter confirms delivery.
-- **Supabase errors**: The service expects the `demo_requests` table and related schema. Confirm the Supabase credentials have permission to read/write that table.
 - **Database connectivity**: For Neon/Postgres, make sure Vercel's IP addresses are allowed or that the connection string enables pooled connections.

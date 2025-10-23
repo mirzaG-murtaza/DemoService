@@ -298,3 +298,97 @@ export async function markDemoRequestAccess(
   }
 }
 
+export async function updateDemoRequestProfile(
+  id: number,
+  updates: {
+    fullName?: string | null;
+    email?: string | null;
+    designation?: string | null;
+    companySize?: string | null;
+    numberOfBranches?: string | null;
+    lastAccessedAt?: Date | string | null;
+  },
+) {
+  const activePool = requirePool();
+  const client = await activePool.connect();
+
+  const fields: string[] = [];
+  const values: any[] = [];
+
+  const pushField = (column: string, value: unknown) => {
+    fields.push(`${column} = $${fields.length + 1}`);
+    values.push(value);
+  };
+
+  if (Object.prototype.hasOwnProperty.call(updates, 'fullName')) {
+    pushField('full_name', updates.fullName ?? null);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'email')) {
+    pushField('email', updates.email ?? null);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'designation')) {
+    pushField('designation', updates.designation ?? null);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'companySize')) {
+    pushField('company_size', updates.companySize ?? null);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'numberOfBranches')) {
+    pushField('number_of_branches', updates.numberOfBranches ?? null);
+  }
+  if (Object.prototype.hasOwnProperty.call(updates, 'lastAccessedAt')) {
+    const last =
+      updates.lastAccessedAt instanceof Date
+        ? updates.lastAccessedAt.toISOString()
+        : updates.lastAccessedAt ?? null;
+    pushField('last_accessed_at', last);
+  }
+
+  if (fields.length === 0) {
+    client.release();
+    return;
+  }
+
+  values.push(id);
+
+  try {
+    await client.query(
+      `UPDATE demo_requests
+       SET ${fields.join(', ')}
+       WHERE id = $${fields.length + 1}`,
+      values,
+    );
+  } finally {
+    client.release();
+  }
+}
+
+export async function insertDemoAccessLogEntry(payload: {
+  demoRequestId: number;
+  ipAddress?: string | null;
+  userAgent?: string | null;
+  accessedAt?: Date | string;
+}) {
+  const activePool = requirePool();
+  const client = await activePool.connect();
+
+  const accessedAt =
+    payload.accessedAt instanceof Date
+      ? payload.accessedAt.toISOString()
+      : payload.accessedAt ?? new Date().toISOString();
+
+  try {
+    await client.query(
+      `INSERT INTO demo_access_logs
+         (demo_request_id, ip_address, user_agent, accessed_at)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        payload.demoRequestId,
+        payload.ipAddress ?? null,
+        payload.userAgent ?? null,
+        accessedAt,
+      ],
+    );
+  } finally {
+    client.release();
+  }
+}

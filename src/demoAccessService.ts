@@ -5,9 +5,10 @@ import {
   markDemoRequestAccess,
   getDemoRequestByToken,
   getDemoRequestByEmail,
+  updateDemoRequestProfile,
+  insertDemoAccessLogEntry,
   type DemoRequestRow,
 } from "./lib/demo-db";
-import { executeQuery } from "./lib/supabase-db-config";
 
 const DEMO_CONVERSATION_LIMIT = Number(
   process.env.DEMO_CONVERSATION_LIMIT ||
@@ -211,58 +212,6 @@ async function sendDemoAccessEmail(
   }
 }
 
-async function upsertSupabaseDemoRequest(
-  email: string,
-  data: Record<string, any>
-): Promise<number | null> {
-  try {
-    const existing = await executeQuery("demo_requests", "select", {
-      filter: { email },
-    });
-
-    if (existing.length > 0) {
-      await executeQuery("demo_requests", "update", {
-        data,
-        filter: { email },
-      });
-      return existing[0]?.id ?? null;
-    }
-
-    const inserted = await executeQuery("demo_requests", "insert", {
-      data: {
-        ...data,
-        email,
-      },
-    });
-    return inserted[0]?.id ?? null;
-  } catch (error) {
-    console.warn(
-      "[DemoAccessService] Supabase demo_requests sync failed:",
-      error
-    );
-    return null;
-  }
-}
-
-async function markSupabaseEmailSent(id: number | null) {
-  if (!id) return;
-
-  try {
-    await executeQuery("demo_requests", "update", {
-      data: {
-        email_sent: true,
-        email_sent_at: new Date().toISOString(),
-      },
-      filter: { id },
-    });
-  } catch (error) {
-    console.warn(
-      "[DemoAccessService] Supabase email_sent update failed:",
-      error
-    );
-  }
-}
-
 async function issueDemoAccessLink(
   payload: DemoRequestPayload
 ): Promise<DemoLinkResult> {
@@ -283,20 +232,6 @@ async function issueDemoAccessLink(
     hasAccess: true,
   });
 
-  const supabaseId = await upsertSupabaseDemoRequest(payload.email, {
-    name: payload.name,
-    designation: payload.designation,
-    company_size: payload.companySize,
-    branches: payload.branches,
-    requested_at: new Date().toISOString(),
-    access_token: token,
-    access_expiry: expiresAt.toISOString(),
-    access_granted: true,
-    email_sent: false,
-    email_sent_at: null,
-    application,
-  });
-
   const emailSent = await sendDemoAccessEmail(
     payload.name,
     payload.email,
@@ -305,7 +240,6 @@ async function issueDemoAccessLink(
   );
 
   if (emailSent) {
-    await markSupabaseEmailSent(supabaseId);
     await markDemoRequestAccess(neonRecord.id, {
       tokenSentAt: issuedAt,
     });
@@ -315,7 +249,7 @@ async function issueDemoAccessLink(
     token,
     expiresAt,
     emailSent,
-    supabaseId,
+    supabaseId: null,
     neonId: neonRecord.id,
     application,
   };
@@ -518,12 +452,9 @@ export async function incrementDemoConversation(
   }
 
   try {
-    await executeQuery("demo_requests", "update", {
-      data: {
-        conversation_count: nextCount,
-        last_conversation_at: new Date().toISOString(),
-      },
-      filter: { id: demoRequest.id },
+    await markDemoRequestAccess(demoRequest.id, {
+      conversationCount: nextCount,
+      lastConversationAt: new Date(),
     });
   } catch (error) {
     console.warn(
@@ -580,18 +511,14 @@ export async function logDemoTokenAccessEvent(params: {
   const requestedApplication = normalizeApplication(application);
 
   try {
-    const existing = await executeQuery("demo_requests", "select", {
-      filter: { access_token: contactId },
-      limit: 1,
-    });
+    const now = new Date();
+    const existing = await getDemoRequestByToken(contactId);
 
-    let demoRequestId: number | null = null;
+    let demoRequestId: number;
 
-    if (existing.length > 0) {
-      const existingRecord = existing[0];
-      demoRequestId = existingRecord.id ?? null;
-      const recordApplication = existingRecord.application
-        ? normalizeApplication(existingRecord.application)
+    if (existing) {
+      const recordApplication = existing.application
+        ? normalizeApplication(existing.application)
         : requestedApplication;
 
       if (requestedApplication !== recordApplication) {
@@ -602,49 +529,39 @@ export async function logDemoTokenAccessEvent(params: {
         );
       }
 
-      await executeQuery("demo_requests", "update", {
-        data: {
-          last_accessed_at: new Date().toISOString(),
-          ...(name && { name }),
-          ...(email && { email }),
-          ...(designation && { designation }),
-          ...(companySize && { company_size: companySize }),
-          ...(branches && { branches }),
-          ...(!existingRecord.application
-            ? { application: requestedApplication }
-            : {}),
-        },
-        filter: { id: existingRecord.id },
+      await updateDemoRequestProfile(existing.id, {
+        fullName: name ?? undefined,
+        email: email ?? undefined,
+        designation: designation ?? undefined,
+        companySize: companySize ?? undefined,
+        numberOfBranches: branches ?? undefined,
+        lastAccessedAt: now,
       });
+
+      demoRequestId = existing.id;
     } else {
-      const applicationForInsert = requestedApplication;
-      const inserted = await executeQuery("demo_requests", "insert", {
-        data: {
-          name: name || "Unknown User",
-          email: email || "unknown@example.com",
-          designation: designation || "Unknown",
-          company_size: companySize || "Unknown",
-          branches: branches || "Unknown",
-          access_token: contactId,
-          access_granted: true,
-          access_expiry: calculateExpiryDate().toISOString(),
-          last_accessed_at: new Date().toISOString(),
-          application: applicationForInsert,
-        },
+      const saveResult = await saveDemoRequestToPostgres({
+        fullName: name || "Unknown User",
+        email: email || "unknown@example.com",
+        designation: designation || "Unknown",
+        companySize: companySize || "Unknown",
+        numberOfBranches: branches || "Unknown",
+        application: requestedApplication,
+        accessToken: contactId,
+        accessExpiry: calculateExpiryDate().toISOString(),
+        hasAccess: true,
+        lastAccessedAt: now,
       });
-      demoRequestId = inserted[0]?.id ?? null;
+
+      demoRequestId = saveResult.id;
     }
 
-    if (demoRequestId) {
-      await executeQuery("demo_access_logs", "insert", {
-        data: {
-          demo_request_id: demoRequestId,
-          ip_address: ipAddress || "Unknown",
-          user_agent: userAgent || "Unknown",
-          accessed_at: new Date().toISOString(),
-        },
-      });
-    }
+    await insertDemoAccessLogEntry({
+      demoRequestId,
+      ipAddress: ipAddress || "Unknown",
+      userAgent: userAgent || "Unknown",
+      accessedAt: now,
+    });
   } catch (error) {
     console.error("[DemoAccessService] Failed to log demo access event:", error);
     throw new DemoAccessServiceError(
