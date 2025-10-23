@@ -212,6 +212,56 @@ async function sendDemoAccessEmail(
   }
 }
 
+async function sendDemoDuplicateNoticeEmail(
+  fullName: string,
+  recipient: string,
+  application: string
+): Promise<boolean> {
+  const transporter = createEmailTransporter();
+
+  if (!transporter) {
+    console.warn(
+      "[DemoAccessService] Email transporter not configured; skipping duplicate request notification."
+    );
+    return true;
+  }
+
+  const applicationLabel = getApplicationLabel(application);
+  const safeName = fullName || "there";
+
+  const mailOptions = {
+    from: EMAIL_FROM,
+    to: recipient,
+    subject: `${applicationLabel} Demo Already Used`,
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2>${applicationLabel} Demo Already Used</h2>
+        <p>Hello ${safeName},</p>
+        <p>Thanks for your interest in the ${applicationLabel} experience. Our records show that this email address has already used the demo for this application.</p>
+        <p>Please contact the BTL Admin for a full tour of our application and to discuss next steps.</p>
+        <p>We look forward to guiding you through everything ${applicationLabel} has to offer.</p>
+        <p>Warm regards,<br/>The VoiceThru Team</p>
+      </div>
+    `,
+  };
+
+  try {
+    await transporter.verify();
+    const info = await transporter.sendMail(mailOptions);
+    console.log("[DemoAccessService] Duplicate demo notification email sent", {
+      messageId: info.messageId,
+      preview: nodemailer.getTestMessageUrl(info),
+    });
+    return true;
+  } catch (error) {
+    console.error(
+      "[DemoAccessService] Failed to send duplicate demo notification email:",
+      error
+    );
+    return false;
+  }
+}
+
 async function issueDemoAccessLink(
   payload: DemoRequestPayload
 ): Promise<DemoLinkResult> {
@@ -258,7 +308,47 @@ async function issueDemoAccessLink(
 export async function submitDemoRequest(
   payload: DemoRequestPayload
 ): Promise<DemoLinkResult> {
-  return issueDemoAccessLink(payload);
+  const application = normalizeApplication(payload.application);
+  const existing = await getDemoRequestByEmail(payload.email);
+
+  if (existing) {
+    const recordApplication = existing.application
+      ? normalizeApplication(existing.application)
+      : application;
+
+    if (recordApplication === application) {
+      await updateDemoRequestProfile(existing.id, {
+        fullName: payload.name,
+        designation: payload.designation,
+        companySize: payload.companySize,
+        numberOfBranches: payload.branches,
+      });
+
+      const emailSent = await sendDemoDuplicateNoticeEmail(
+        payload.name,
+        payload.email,
+        application
+      );
+
+      let expiresAt = existing.access_expiry
+        ? new Date(existing.access_expiry)
+        : null;
+      if (!expiresAt || Number.isNaN(expiresAt.getTime())) {
+        expiresAt = calculateExpiryDate();
+      }
+
+      return {
+        token: existing.access_token ?? "",
+        expiresAt,
+        emailSent,
+        supabaseId: null,
+        neonId: existing.id,
+        application,
+      };
+    }
+  }
+
+  return issueDemoAccessLink({ ...payload, application });
 }
 
 export async function resendDemoAccessLink(
