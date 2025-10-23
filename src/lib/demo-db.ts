@@ -1,4 +1,4 @@
-import { Pool } from 'pg';
+import { Pool, PoolClient } from 'pg';
 
 const connectionString =
   process.env.DEMO_DATABASE_URL ||
@@ -13,11 +13,80 @@ const pool = connectionString
     })
   : null;
 
+async function initializeDemoConstraints(client: PoolClient) {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS demo_constraints (
+      id SERIAL PRIMARY KEY,
+      conversation_timer INTERVAL NULL,
+      conversations_allowed INTEGER NULL,
+      token_expiry INTERVAL NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  await client.query(
+    `
+    INSERT INTO demo_constraints (conversation_timer, conversations_allowed, token_expiry)
+    SELECT $1::INTERVAL, $2::INTEGER, $3::INTERVAL
+    WHERE NOT EXISTS (SELECT 1 FROM demo_constraints)
+    `,
+    ['3 minutes', 3, '7 days'],
+  );
+}
+
+const constraintsInitialization: Promise<void> | null = pool
+  ? (async () => {
+      const client = await pool.connect();
+      try {
+        await initializeDemoConstraints(client);
+      } catch (error) {
+        console.error('[DemoAccessService] Failed to initialize demo_constraints table:', error);
+      } finally {
+        client.release();
+      }
+    })()
+  : null;
+
 function requirePool() {
   if (!pool) {
     throw new Error('Demo database connection is not configured.');
   }
   return pool;
+}
+
+export type DemoConstraintsRow = {
+  id: number;
+  conversation_timer_seconds: number | null;
+  conversations_allowed: number | null;
+  token_expiry_seconds: number | null;
+};
+
+export async function getDemoConstraints(): Promise<DemoConstraintsRow | null> {
+  const activePool = requirePool();
+  if (constraintsInitialization) {
+    await constraintsInitialization;
+  }
+
+  const client = await activePool.connect();
+
+  try {
+    const result = await client.query<DemoConstraintsRow>(
+      `
+        SELECT
+          id,
+          EXTRACT(EPOCH FROM conversation_timer) AS conversation_timer_seconds,
+          conversations_allowed,
+          EXTRACT(EPOCH FROM token_expiry) AS token_expiry_seconds
+        FROM demo_constraints
+        ORDER BY id ASC
+        LIMIT 1
+      `,
+    );
+    return result.rows[0] ?? null;
+  } finally {
+    client.release();
+  }
 }
 
 export type DemoRequestRecord = {

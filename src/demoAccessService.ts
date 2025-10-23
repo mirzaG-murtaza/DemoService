@@ -7,20 +7,9 @@ import {
   getDemoRequestByEmail,
   updateDemoRequestProfile,
   insertDemoAccessLogEntry,
+  getDemoConstraints,
   type DemoRequestRow,
 } from "./lib/demo-db";
-
-const DEMO_CONVERSATION_LIMIT = Number(
-  process.env.DEMO_CONVERSATION_LIMIT ||
-    process.env.NEXT_PUBLIC_DEMO_CONVERSATION_LIMIT ||
-    "3"
-);
-
-const DEMO_TOKEN_TTL_DAYS = Number(
-  process.env.DEMO_TOKEN_TTL_DAYS ||
-    process.env.NEXT_PUBLIC_DEMO_TOKEN_TTL_DAYS ||
-    "7"
-);
 
 const APP_BASE_URL =
   process.env.APP_BASE_URL ||
@@ -43,6 +32,66 @@ const APPLICATION_LABELS: Record<string, string> = {
 };
 
 const DEFAULT_APPLICATION = ALLOWED_APPLICATIONS[0] || "voicethru";
+
+const DEFAULT_CONSTRAINTS = {
+  conversationTimerSeconds: 3 * 60,
+  conversationsAllowed: 3,
+  tokenExpirySeconds: 7 * 24 * 60 * 60,
+} as const;
+
+type ResolvedConstraints = {
+  conversationTimerSeconds: number;
+  conversationsAllowed: number;
+  tokenExpirySeconds: number;
+};
+
+let constraintsPromise: Promise<ResolvedConstraints> | null = null;
+
+async function loadConstraints(): Promise<ResolvedConstraints> {
+  if (!constraintsPromise) {
+    constraintsPromise = (async () => {
+      const row = await getDemoConstraints();
+
+      if (!row) {
+        return {
+          ...DEFAULT_CONSTRAINTS,
+        };
+      }
+
+      const conversationTimerSeconds =
+        typeof row.conversation_timer_seconds === "number" &&
+        Number.isFinite(row.conversation_timer_seconds) &&
+        row.conversation_timer_seconds > 0
+          ? Math.floor(row.conversation_timer_seconds)
+          : DEFAULT_CONSTRAINTS.conversationTimerSeconds;
+
+      const conversationsAllowed =
+        typeof row.conversations_allowed === "number" &&
+        Number.isFinite(row.conversations_allowed) &&
+        row.conversations_allowed >= 0
+          ? Math.floor(row.conversations_allowed)
+          : DEFAULT_CONSTRAINTS.conversationsAllowed;
+
+      const tokenExpirySeconds =
+        typeof row.token_expiry_seconds === "number" &&
+        Number.isFinite(row.token_expiry_seconds) &&
+        row.token_expiry_seconds > 0
+          ? Math.floor(row.token_expiry_seconds)
+          : DEFAULT_CONSTRAINTS.tokenExpirySeconds;
+
+      return {
+        conversationTimerSeconds,
+        conversationsAllowed,
+        tokenExpirySeconds,
+      };
+    })().catch((error) => {
+      console.error("[DemoAccessService] Failed to load demo constraints:", error);
+      return { ...DEFAULT_CONSTRAINTS };
+    });
+  }
+
+  return constraintsPromise;
+}
 
 function normalizeApplication(input?: string | null): string {
   const trimmed = (input ?? "").trim().toLowerCase();
@@ -121,10 +170,15 @@ function generateDemoToken(): string {
   return uuidv4();
 }
 
-function calculateExpiryDate(from = new Date()): Date {
-  const expiry = new Date(from);
-  expiry.setDate(expiry.getDate() + DEMO_TOKEN_TTL_DAYS);
-  return expiry;
+function calculateExpiryDate(
+  ttlSeconds: number,
+  from = new Date()
+): Date {
+  const safeTtl =
+    typeof ttlSeconds === "number" && Number.isFinite(ttlSeconds) && ttlSeconds > 0
+      ? ttlSeconds
+      : DEFAULT_CONSTRAINTS.tokenExpirySeconds;
+  return new Date(from.getTime() + safeTtl * 1000);
 }
 
 function buildDemoLink(token: string, application: string) {
@@ -166,11 +220,32 @@ function createEmailTransporter(): nodemailer.Transporter | null {
   });
 }
 
+function describeDuration(seconds: number): string {
+  const safeSeconds =
+    typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
+      ? seconds
+      : DEFAULT_CONSTRAINTS.tokenExpirySeconds;
+
+  const minutes = Math.round(safeSeconds / 60);
+  if (minutes < 60) {
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+
+  const hours = Math.round(safeSeconds / 3600);
+  if (hours < 48) {
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+
+  const days = Math.round(safeSeconds / 86400);
+  return `${days} day${days === 1 ? "" : "s"}`;
+}
+
 async function sendDemoAccessEmail(
   fullName: string,
   recipient: string,
   token: string,
-  application: string
+  application: string,
+  tokenExpirySeconds: number
 ): Promise<boolean> {
   try {
     const transporter = createEmailTransporter();
@@ -183,6 +258,7 @@ async function sendDemoAccessEmail(
 
     const applicationLabel = getApplicationLabel(application);
     const link = buildDemoLink(token, application);
+    const expiryDescription = describeDuration(tokenExpirySeconds);
     const mailOptions = {
       from: EMAIL_FROM,
       to: recipient,
@@ -191,7 +267,7 @@ async function sendDemoAccessEmail(
         <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
           <h2>Your ${applicationLabel} demo link is ready</h2>
           <p>Hello ${fullName || "there"},</p>
-          <p>Use the link below to access your ${applicationLabel} demo. This link expires in ${DEMO_TOKEN_TTL_DAYS} days.</p>
+          <p>Use the link below to access your ${applicationLabel} demo. This link expires in ${expiryDescription}.</p>
           <p><a href="${link}" style="display: inline-block; background-color: #4F46E5; color: white; padding: 10px 20px; text-decoration: none; border-radius: 4px;">Launch Demo</a></p>
           <p>If you did not request this link, please ignore this email.</p>
           <p>Thanks,<br>The ${applicationLabel} Team</p>
@@ -263,11 +339,22 @@ async function sendDemoDuplicateNoticeEmail(
 }
 
 async function issueDemoAccessLink(
-  payload: DemoRequestPayload
+  payload: DemoRequestPayload,
+  constraintsOverride?: ResolvedConstraints
 ): Promise<DemoLinkResult> {
+  const constraints = constraintsOverride ?? (await loadConstraints());
+  const conversationLimit = Math.max(
+    Number.isFinite(constraints.conversationsAllowed)
+      ? constraints.conversationsAllowed
+      : DEFAULT_CONSTRAINTS.conversationsAllowed,
+    0
+  );
   const token = generateDemoToken();
   const issuedAt = new Date();
-  const expiresAt = calculateExpiryDate(issuedAt);
+  const expiresAt = calculateExpiryDate(
+    constraints.tokenExpirySeconds,
+    issuedAt
+  );
   const application = normalizeApplication(payload.application);
 
   const neonRecord = await saveDemoRequestToPostgres({
@@ -279,15 +366,16 @@ async function issueDemoAccessLink(
     application,
     accessToken: token,
     accessExpiry: expiresAt,
-    hasAccess: true,
-    conversationCount: DEMO_CONVERSATION_LIMIT,
+    hasAccess: conversationLimit > 0,
+    conversationCount: conversationLimit,
   });
 
   const emailSent = await sendDemoAccessEmail(
     payload.name,
     payload.email,
     token,
-    application
+    application,
+    constraints.tokenExpirySeconds
   );
 
   if (emailSent) {
@@ -309,6 +397,7 @@ async function issueDemoAccessLink(
 export async function submitDemoRequest(
   payload: DemoRequestPayload
 ): Promise<DemoLinkResult> {
+  const constraints = await loadConstraints();
   const application = normalizeApplication(payload.application);
   const existing = await getDemoRequestByEmail(payload.email);
 
@@ -335,7 +424,7 @@ export async function submitDemoRequest(
         ? new Date(existing.access_expiry)
         : null;
       if (!expiresAt || Number.isNaN(expiresAt.getTime())) {
-        expiresAt = calculateExpiryDate();
+        expiresAt = calculateExpiryDate(constraints.tokenExpirySeconds);
       }
 
       return {
@@ -349,7 +438,7 @@ export async function submitDemoRequest(
     }
   }
 
-  return issueDemoAccessLink({ ...payload, application });
+  return issueDemoAccessLink({ ...payload, application }, constraints);
 }
 
 export async function resendDemoAccessLink(
@@ -383,14 +472,19 @@ export async function resendDemoAccessLink(
     );
   }
 
-  return issueDemoAccessLink({
-    name: existing.full_name || "Guest",
-    email: existing.email,
-    designation: existing.designation || "Unknown",
-    companySize: existing.company_size || "Unknown",
-    branches: existing.number_of_branches || "Unknown",
-    application: recordApplication,
-  });
+  const constraints = await loadConstraints();
+
+  return issueDemoAccessLink(
+    {
+      name: existing.full_name || "Guest",
+      email: existing.email,
+      designation: existing.designation || "Unknown",
+      companySize: existing.company_size || "Unknown",
+      branches: existing.number_of_branches || "Unknown",
+      application: recordApplication,
+    },
+    constraints
+  );
 }
 
 interface ValidateOptions {
@@ -471,14 +565,27 @@ export async function validateDemoToken(
     throw new DemoAccessServiceError("expired", "Token has expired", 403);
   }
 
+  const constraints = await loadConstraints();
+  const conversationLimit = Math.max(
+    Number.isFinite(constraints.conversationsAllowed)
+      ? constraints.conversationsAllowed
+      : DEFAULT_CONSTRAINTS.conversationsAllowed,
+    0
+  );
   const remainingConversations =
-    demoRequest.conversation_count ?? DEMO_CONVERSATION_LIMIT;
+    typeof demoRequest.conversation_count === "number" &&
+    Number.isFinite(demoRequest.conversation_count)
+      ? demoRequest.conversation_count
+      : conversationLimit;
   const usedConversations = Math.max(
-    DEMO_CONVERSATION_LIMIT - remainingConversations,
+    conversationLimit - remainingConversations,
     0
   );
 
-  if (enforceConversationLimit && remainingConversations <= 0) {
+  if (
+    enforceConversationLimit &&
+    (conversationLimit === 0 || remainingConversations <= 0)
+  ) {
     try {
       await markDemoRequestAccess(demoRequest.id, {
         hasAccess: false,
@@ -497,7 +604,7 @@ export async function validateDemoToken(
       403,
       {
         conversationCount: usedConversations,
-        conversationLimit: DEMO_CONVERSATION_LIMIT,
+        conversationLimit,
       }
     );
   }
@@ -513,7 +620,7 @@ export async function validateDemoToken(
     demoRequest,
     expiresAt: expiryDate,
     conversationCount: usedConversations,
-    conversationLimit: DEMO_CONVERSATION_LIMIT,
+    conversationLimit,
     application,
   };
 }
@@ -539,10 +646,21 @@ export async function incrementDemoConversation(
     token,
     normalizedApplication
   );
+
+  const constraints = await loadConstraints();
+  const conversationLimit = Math.max(
+    Number.isFinite(constraints.conversationsAllowed)
+      ? constraints.conversationsAllowed
+      : DEFAULT_CONSTRAINTS.conversationsAllowed,
+    0
+  );
   const remainingConversations =
-    demoRequest.conversation_count ?? DEMO_CONVERSATION_LIMIT;
+    typeof demoRequest.conversation_count === "number" &&
+    Number.isFinite(demoRequest.conversation_count)
+      ? demoRequest.conversation_count
+      : conversationLimit;
   const usedConversations = Math.max(
-    DEMO_CONVERSATION_LIMIT - remainingConversations,
+    conversationLimit - remainingConversations,
     0
   );
   const minimumNextUsed = usedConversations + 1;
@@ -553,7 +671,7 @@ export async function incrementDemoConversation(
       : minimumNextUsed;
   const nextUsedCount = requestedUsedCount;
 
-  if (nextUsedCount > DEMO_CONVERSATION_LIMIT) {
+  if (nextUsedCount > conversationLimit) {
     try {
       await markDemoRequestAccess(demoRequest.id, {
         hasAccess: false,
@@ -572,13 +690,13 @@ export async function incrementDemoConversation(
       403,
       {
         conversationCount: usedConversations,
-        conversationLimit: DEMO_CONVERSATION_LIMIT,
+        conversationLimit,
       }
     );
   }
 
   const nextRemainingCount = Math.max(
-    DEMO_CONVERSATION_LIMIT - nextUsedCount,
+    conversationLimit - nextUsedCount,
     0
   );
 
@@ -597,7 +715,7 @@ export async function incrementDemoConversation(
 
   return {
     conversationCount: nextUsedCount,
-    conversationLimit: DEMO_CONVERSATION_LIMIT,
+    conversationLimit,
   };
 }
 
@@ -641,6 +759,13 @@ export async function logDemoTokenAccessEvent(params: {
   }
 
   const requestedApplication = normalizeApplication(application);
+  const constraints = await loadConstraints();
+  const conversationLimit = Math.max(
+    Number.isFinite(constraints.conversationsAllowed)
+      ? constraints.conversationsAllowed
+      : DEFAULT_CONSTRAINTS.conversationsAllowed,
+    0
+  );
 
   try {
     const now = new Date();
@@ -672,6 +797,11 @@ export async function logDemoTokenAccessEvent(params: {
 
       demoRequestId = existing.id;
     } else {
+      const accessExpiry = calculateExpiryDate(
+        constraints.tokenExpirySeconds,
+        now
+      ).toISOString();
+
       const saveResult = await saveDemoRequestToPostgres({
         fullName: name || "Unknown User",
         email: email || "unknown@example.com",
@@ -680,8 +810,9 @@ export async function logDemoTokenAccessEvent(params: {
         numberOfBranches: branches || "Unknown",
         application: requestedApplication,
         accessToken: contactId,
-        accessExpiry: calculateExpiryDate().toISOString(),
-        hasAccess: true,
+        accessExpiry,
+        hasAccess: conversationLimit > 0,
+        conversationCount: conversationLimit,
         lastAccessedAt: now,
       });
 
