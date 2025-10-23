@@ -280,6 +280,7 @@ async function issueDemoAccessLink(
     accessToken: token,
     accessExpiry: expiresAt,
     hasAccess: true,
+    conversationCount: DEMO_CONVERSATION_LIMIT,
   });
 
   const emailSent = await sendDemoAccessEmail(
@@ -470,15 +471,32 @@ export async function validateDemoToken(
     throw new DemoAccessServiceError("expired", "Token has expired", 403);
   }
 
-  const conversationCount = demoRequest.conversation_count ?? 0;
+  const remainingConversations =
+    demoRequest.conversation_count ?? DEMO_CONVERSATION_LIMIT;
+  const usedConversations = Math.max(
+    DEMO_CONVERSATION_LIMIT - remainingConversations,
+    0
+  );
 
-  if (enforceConversationLimit && conversationCount >= DEMO_CONVERSATION_LIMIT) {
+  if (enforceConversationLimit && remainingConversations <= 0) {
+    try {
+      await markDemoRequestAccess(demoRequest.id, {
+        hasAccess: false,
+        conversationCount: 0,
+      });
+    } catch (error) {
+      console.warn(
+        "[DemoAccessService] Failed to disable access during limit validation:",
+        error
+      );
+    }
+
     throw new DemoAccessServiceError(
       "limit_reached",
       "Conversation limit reached",
       403,
       {
-        conversationCount,
+        conversationCount: usedConversations,
         conversationLimit: DEMO_CONVERSATION_LIMIT,
       }
     );
@@ -494,7 +512,7 @@ export async function validateDemoToken(
   return {
     demoRequest,
     expiresAt: expiryDate,
-    conversationCount,
+    conversationCount: usedConversations,
     conversationLimit: DEMO_CONVERSATION_LIMIT,
     application,
   };
@@ -521,30 +539,54 @@ export async function incrementDemoConversation(
     token,
     normalizedApplication
   );
-  const conversationCount = demoRequest.conversation_count ?? 0;
-  const minimumNextCount = conversationCount + 1;
-  const normalizedRequestedCount =
-    typeof requestedCount === "number" && Number.isFinite(requestedCount)
-      ? Math.max(requestedCount, minimumNextCount)
-      : minimumNextCount;
-  const nextCount = normalizedRequestedCount;
+  const remainingConversations =
+    demoRequest.conversation_count ?? DEMO_CONVERSATION_LIMIT;
+  const usedConversations = Math.max(
+    DEMO_CONVERSATION_LIMIT - remainingConversations,
+    0
+  );
+  const minimumNextUsed = usedConversations + 1;
 
-  if (nextCount > DEMO_CONVERSATION_LIMIT) {
+  const requestedUsedCount =
+    typeof requestedCount === "number" && Number.isFinite(requestedCount)
+      ? Math.max(requestedCount, minimumNextUsed)
+      : minimumNextUsed;
+  const nextUsedCount = requestedUsedCount;
+
+  if (nextUsedCount > DEMO_CONVERSATION_LIMIT) {
+    try {
+      await markDemoRequestAccess(demoRequest.id, {
+        hasAccess: false,
+        conversationCount: 0,
+      });
+    } catch (error) {
+      console.warn(
+        "[DemoAccessService] Failed to disable access after exceeding conversation limit:",
+        error
+      );
+    }
+
     throw new DemoAccessServiceError(
       "limit_reached",
       "Conversation limit reached",
       403,
       {
-        conversationCount,
+        conversationCount: usedConversations,
         conversationLimit: DEMO_CONVERSATION_LIMIT,
       }
     );
   }
 
+  const nextRemainingCount = Math.max(
+    DEMO_CONVERSATION_LIMIT - nextUsedCount,
+    0
+  );
+
   try {
     await markDemoRequestAccess(demoRequest.id, {
-      conversationCount: nextCount,
+      conversationCount: nextRemainingCount,
       lastConversationAt: new Date(),
+      hasAccess: nextRemainingCount > 0,
     });
   } catch (error) {
     console.warn(
@@ -554,7 +596,7 @@ export async function incrementDemoConversation(
   }
 
   return {
-    conversationCount: nextCount,
+    conversationCount: nextUsedCount,
     conversationLimit: DEMO_CONVERSATION_LIMIT,
   };
 }
