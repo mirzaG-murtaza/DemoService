@@ -39,6 +39,31 @@ const DEFAULT_CONSTRAINTS = {
   tokenExpirySeconds: 7 * 24 * 60 * 60,
 } as const;
 
+const PERSONAL_EMAIL_DOMAINS = new Set<string>([
+  "gmail.com",
+  "googlemail.com",
+  "yahoo.com",
+  "yahoo.co.uk",
+  "hotmail.com",
+  "hotmail.co.uk",
+  "outlook.com",
+  "outlook.co.uk",
+  "live.com",
+  "msn.com",
+  "icloud.com",
+  "mac.com",
+  "me.com",
+  "aol.com",
+  "protonmail.com",
+  "proton.me",
+  "pm.me",
+  "yandex.com",
+  "mail.com",
+  "gmx.com",
+  "gmx.de",
+  "hey.com",
+]);
+
 type ResolvedConstraints = {
   conversationTimerSeconds: number;
   conversationsAllowed: number;
@@ -168,6 +193,39 @@ export interface DemoTokenValidationResult {
 
 function generateDemoToken(): string {
   return uuidv4();
+}
+
+function normalizeEmail(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function ensureWorkEmail(email: string): string {
+  const normalized = normalizeEmail(email);
+
+  const match = normalized.match(
+    /^[^\s@]+@([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+)$/
+  );
+
+  if (!match) {
+    throw new DemoAccessServiceError(
+      "invalid_email",
+      "Please provide a valid email address.",
+      400
+    );
+  }
+
+  const domain = match[1].toLowerCase();
+
+  if (PERSONAL_EMAIL_DOMAINS.has(domain)) {
+    throw new DemoAccessServiceError(
+      "work_email_required",
+      "Please use your work email address.",
+      400,
+      { domain }
+    );
+  }
+
+  return normalized;
 }
 
 function calculateExpiryDate(
@@ -399,7 +457,8 @@ export async function submitDemoRequest(
 ): Promise<DemoLinkResult> {
   const constraints = await loadConstraints();
   const application = normalizeApplication(payload.application);
-  const existing = await getDemoRequestByEmail(payload.email);
+  const normalizedEmail = ensureWorkEmail(payload.email);
+  const existing = await getDemoRequestByEmail(normalizedEmail);
 
   if (existing) {
     const recordApplication = existing.application
@@ -409,6 +468,7 @@ export async function submitDemoRequest(
     if (recordApplication === application) {
       await updateDemoRequestProfile(existing.id, {
         fullName: payload.name,
+        email: normalizedEmail,
         designation: payload.designation,
         companySize: payload.companySize,
         numberOfBranches: payload.branches,
@@ -416,7 +476,7 @@ export async function submitDemoRequest(
 
       const emailSent = await sendDemoDuplicateNoticeEmail(
         payload.name,
-        payload.email,
+        normalizedEmail,
         application
       );
 
@@ -438,7 +498,10 @@ export async function submitDemoRequest(
     }
   }
 
-  return issueDemoAccessLink({ ...payload, application }, constraints);
+  return issueDemoAccessLink(
+    { ...payload, email: normalizedEmail, application },
+    constraints
+  );
 }
 
 export async function resendDemoAccessLink(
@@ -453,7 +516,8 @@ export async function resendDemoAccessLink(
     );
   }
 
-  const existing = await getDemoRequestByEmail(email);
+  const normalizedEmail = ensureWorkEmail(email);
+  const existing = await getDemoRequestByEmail(normalizedEmail);
   if (!existing) {
     throw new DemoAccessServiceError(
       "not_found",
@@ -477,7 +541,7 @@ export async function resendDemoAccessLink(
   return issueDemoAccessLink(
     {
       name: existing.full_name || "Guest",
-      email: existing.email,
+      email: normalizedEmail,
       designation: existing.designation || "Unknown",
       companySize: existing.company_size || "Unknown",
       branches: existing.number_of_branches || "Unknown",

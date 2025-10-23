@@ -170,7 +170,7 @@ export async function saveDemoRequestToPostgres(
 
   try {
     const existing = await client.query<{ id: number }>(
-      'SELECT id FROM demo_requests WHERE email = $1 LIMIT 1',
+      'SELECT id FROM demo_requests WHERE LOWER(email) = LOWER($1) LIMIT 1',
       [email],
     );
 
@@ -279,7 +279,7 @@ export async function getDemoRequestByEmail(
 
   try {
     const result = await client.query<DemoRequestRow>(
-      'SELECT * FROM demo_requests WHERE email = $1 LIMIT 1',
+      'SELECT * FROM demo_requests WHERE LOWER(email) = LOWER($1) LIMIT 1',
       [email],
     );
     return result.rows[0] ?? null;
