@@ -1,5 +1,6 @@
-import { v4 as uuidv4 } from "uuid";
 import nodemailer from "nodemailer";
+import { promises as dns } from "dns";
+import { v4 as uuidv4 } from "uuid";
 import {
   saveDemoRequestToPostgres,
   markDemoRequestAccess,
@@ -199,7 +200,68 @@ function normalizeEmail(value: string): string {
   return value.trim().toLowerCase();
 }
 
-function ensureWorkEmail(email: string): string {
+function isMissingDomainError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOTFOUND" || code === "ENODATA" || code === "NXDOMAIN";
+}
+
+async function assertDeliverableEmailDomain(domain: string, submittedEmail: string) {
+  let mxError: NodeJS.ErrnoException | null = null;
+  try {
+    const mxRecords = await dns.resolveMx(domain);
+    if (Array.isArray(mxRecords) && mxRecords.length > 0) {
+      return;
+    }
+  } catch (error) {
+    mxError = error as NodeJS.ErrnoException;
+    if (!isMissingDomainError(mxError)) {
+      console.warn(
+        "[DemoAccessService] MX lookup failed but not treated as fatal",
+        domain,
+        mxError
+      );
+      return;
+    }
+  }
+
+  let addressError: NodeJS.ErrnoException | null = null;
+  try {
+    const addresses = await dns.resolve(domain);
+    if (Array.isArray(addresses) && addresses.length > 0) {
+      return;
+    }
+  } catch (error) {
+    addressError = error as NodeJS.ErrnoException;
+    if (!isMissingDomainError(addressError)) {
+      console.warn(
+        "[DemoAccessService] A record lookup failed but not treated as fatal",
+        domain,
+        addressError
+      );
+      return;
+    }
+  }
+
+  throw new DemoAccessServiceError(
+    "invalid_email_domain",
+    "We couldn't verify the email domain. Please double-check your work email address.",
+    400,
+    {
+      reason: "undeliverable_email_domain",
+      domain,
+      submittedEmail,
+      mxErrorCode: mxError?.code ?? null,
+      addressErrorCode: addressError?.code ?? null,
+    }
+  );
+}
+
+async function ensureWorkEmail(email: string): Promise<string> {
+  const trimmed = email.trim();
   const normalized = normalizeEmail(email);
 
   const match = normalized.match(
@@ -210,7 +272,11 @@ function ensureWorkEmail(email: string): string {
     throw new DemoAccessServiceError(
       "invalid_email",
       "Please provide a valid email address.",
-      400
+      400,
+      {
+        reason: "invalid_email_format",
+        submittedEmail: trimmed,
+      }
     );
   }
 
@@ -221,9 +287,15 @@ function ensureWorkEmail(email: string): string {
       "work_email_required",
       "Please use your work email address.",
       400,
-      { domain }
+      {
+        reason: "personal_email_domain",
+        domain,
+        submittedEmail: trimmed,
+      }
     );
   }
+
+  await assertDeliverableEmailDomain(domain, trimmed);
 
   return normalized;
 }
@@ -457,7 +529,7 @@ export async function submitDemoRequest(
 ): Promise<DemoLinkResult> {
   const constraints = await loadConstraints();
   const application = normalizeApplication(payload.application);
-  const normalizedEmail = ensureWorkEmail(payload.email);
+  const normalizedEmail = await ensureWorkEmail(payload.email);
   const existing = await getDemoRequestByEmail(normalizedEmail);
 
   if (existing) {
@@ -516,7 +588,7 @@ export async function resendDemoAccessLink(
     );
   }
 
-  const normalizedEmail = ensureWorkEmail(email);
+  const normalizedEmail = await ensureWorkEmail(email);
   const existing = await getDemoRequestByEmail(normalizedEmail);
   if (!existing) {
     throw new DemoAccessServiceError(
