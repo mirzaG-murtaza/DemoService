@@ -437,6 +437,7 @@ export type InvoiceExtractorEmailUsageRow = {
   remaining_attempts: number;
   last_attempt_at: string;
   limit_notified_at: string | null;
+  registration_notified_at: string | null;
   created_at: string;
 };
 
@@ -457,6 +458,7 @@ export async function getInvoiceExtractorEmailUsage(
          remaining_attempts,
          last_attempt_at,
          limit_notified_at,
+         registration_notified_at,
          created_at
        FROM invoice_extractor_email_usage
        WHERE email = $1 AND application = $2
@@ -503,6 +505,7 @@ export async function incrementInvoiceExtractorEmailUsage(
          remaining_attempts,
          last_attempt_at,
          limit_notified_at,
+         registration_notified_at,
          created_at`,
       [email, application, Math.max(allowedAttempts, 0)],
     );
@@ -541,6 +544,7 @@ export async function syncInvoiceExtractorRemainingAttempts(
          remaining_attempts,
          last_attempt_at,
          limit_notified_at,
+         registration_notified_at,
          created_at`,
       [email, application, Math.max(allowedAttempts, 0)],
     );
@@ -582,12 +586,44 @@ export async function markInvoiceExtractorLimitNotification(
     if (result.rowCount === 0) {
       await client.query(
         `INSERT INTO invoice_extractor_email_usage
-           (email, application, attempt_count, remaining_attempts, last_attempt_at, limit_notified_at)
-         VALUES ($1, $2, $3, 0, NOW(), NOW())
+           (email, application, attempt_count, remaining_attempts, last_attempt_at, limit_notified_at, registration_notified_at)
+         VALUES ($1, $2, $3, 0, NOW(), NOW(), NULL)
          ON CONFLICT (email, application) DO NOTHING`,
         [email, application, Math.max(allowedAttempts, 0)],
       );
     }
+  } catch (error) {
+    if ((error as { code?: string })?.code === '42P01') {
+      console.error(
+        '[DemoAccessService] invoice_extractor_email_usage table not found. Please run the corresponding migration.',
+      );
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function markInvoiceExtractorRegistrationNotification(
+  email: string,
+  allowedAttempts: number,
+  application: string = 'invoiceextractor',
+): Promise<void> {
+  const activePool = requirePool();
+  const client = await activePool.connect();
+
+  try {
+    await client.query(
+      `INSERT INTO invoice_extractor_email_usage
+         (email, application, attempt_count, remaining_attempts, last_attempt_at, registration_notified_at)
+       VALUES ($1, $2, 0, $3, NOW(), NOW())
+       ON CONFLICT (email, application)
+       DO UPDATE SET
+         registration_notified_at = NOW(),
+         remaining_attempts = GREATEST($3 - invoice_extractor_email_usage.attempt_count, 0),
+         last_attempt_at = NOW()`,
+      [email, application, Math.max(allowedAttempts, 0)],
+    );
   } catch (error) {
     if ((error as { code?: string })?.code === '42P01') {
       console.error(

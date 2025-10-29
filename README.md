@@ -71,7 +71,43 @@ Successful responses always use HTTP 200 and include a payload describing the de
 }
 ```
 
-- When the usage limit has been exhausted, `allowed` becomes `false`, `decision` becomes `"denied"`, and the service sends a courtesy email to the requester (if SMTP credentials are configured) advising that no further invoice extraction is available.
+- Limit reached example:
+
+```json
+{
+  "data": {
+    "allowed": false,
+    "decision": "denied",
+    "reason": "limit_reached",
+    "email": "user@example.com",
+    "attemptCount": 3,
+    "allowedAttempts": 3,
+    "remainingAttempts": 0,
+    "notificationEmailSent": true
+  }
+}
+```
+
+- Not registered example:
+
+```json
+{
+  "data": {
+    "allowed": false,
+    "decision": "denied",
+    "reason": "not_registered",
+    "email": "new-user@example.com",
+    "attemptCount": 0,
+    "allowedAttempts": 3,
+    "remainingAttempts": 3,
+    "notificationEmailSent": false
+  }
+}
+```
+
+- `limit_reached`: the allowance is exhausted and a courtesy email is sent (if SMTP credentials exist).
+- `not_registered`: the email has no `demo_requests` row for `invoiceextractor`; the service sends a one-time prompt encouraging the user to request access.
+- `application_mismatch`: the email exists but belongs to a different application; access is denied without touching usage counts.
 - The allowance is driven by the shared `demo_constraints.conversations_allowed` value, so updating that table automatically adjusts both demo conversations and invoice extraction usage.
 
 ## Environment Variables
@@ -136,6 +172,7 @@ CREATE TABLE IF NOT EXISTS invoice_extractor_email_usage (
   remaining_attempts INTEGER NOT NULL DEFAULT 0,
   last_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   limit_notified_at TIMESTAMPTZ NULL,
+  registration_notified_at TIMESTAMPTZ NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CONSTRAINT invoice_extractor_email_usage_unique UNIQUE (email, application)
 );
@@ -145,7 +182,32 @@ CREATE INDEX IF NOT EXISTS invoice_extractor_email_usage_email_idx
 ```
 
 This table stores a running counter of successful invoice extraction runs per email address. The endpoint only increments the counter when access is granted, ensuring the stored count mirrors actual usage.
-`remaining_attempts` is recalculated from the shared `demo_constraints.conversations_allowed` limit so any updates to the constraint automatically flow through to future access decisions.
+`remaining_attempts` is recalculated from the shared `demo_constraints.conversations_allowed` limit so any updates to the constraint automatically flow through to future access decisions. The service records `limit_notified_at` and `registration_notified_at` timestamps to avoid spamming follow-up emails once an address has been contacted.
+
+Upgrading an existing deployment? Apply the following before redeploying:
+
+```sql
+ALTER TABLE invoice_extractor_email_usage
+  ADD COLUMN IF NOT EXISTS remaining_attempts INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS registration_notified_at TIMESTAMPTZ NULL;
+
+DO $$
+DECLARE
+  allowed_limit integer;
+BEGIN
+  SELECT COALESCE(conversations_allowed, 0)
+    INTO allowed_limit
+    FROM demo_constraints
+    ORDER BY id ASC
+    LIMIT 1;
+
+  allowed_limit := COALESCE(allowed_limit, 3);
+
+  UPDATE invoice_extractor_email_usage
+  SET remaining_attempts = GREATEST(allowed_limit - attempt_count, 0);
+END
+$$;
+```
 
 ## Troubleshooting
 

@@ -13,6 +13,7 @@ import {
   incrementInvoiceExtractorEmailUsage,
   syncInvoiceExtractorRemainingAttempts,
   markInvoiceExtractorLimitNotification,
+  markInvoiceExtractorRegistrationNotification,
   type DemoRequestRow,
 } from "./lib/demo-db";
 
@@ -537,6 +538,64 @@ async function sendInvoiceExtractorLimitEmail(
   }
 }
 
+async function sendInvoiceExtractorRegistrationEmail(
+  recipient: string
+): Promise<boolean> {
+  const transporter = createEmailTransporter();
+
+  if (!transporter) {
+    console.warn(
+      "[DemoAccessService] Email transporter not configured; skipping invoice extractor registration prompt."
+    );
+    return false;
+  }
+
+  const applicationLabel = getApplicationLabel(INVOICE_EXTRACTOR_APPLICATION);
+
+  const mailOptions = {
+    from: EMAIL_FROM,
+    to: recipient,
+    subject: `Access ${applicationLabel} Invoice Extraction`,
+    text: [
+      `Hi there,`,
+      ``,
+      `We couldn't find an active ${applicationLabel} demo request for this email address.`,
+      `Please submit the invoice extractor demo form so we can enable access and track your usage allowance.`,
+      ``,
+      `If you believe this is an error, reach out to our team and we'll get you set up.`,
+      ``,
+      `Regards,`,
+      `The ${applicationLabel} Team`,
+    ].join("\n"),
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2>Request ${applicationLabel} Access</h2>
+        <p>Hi there,</p>
+        <p>We couldn't find an active ${applicationLabel} demo request for this email address.</p>
+        <p>Please submit the invoice extractor demo form so we can enable access and track your usage allowance.</p>
+        <p>If you believe this is an error, reach out to our team and we'll get you set up.</p>
+        <p>Regards,<br/>The ${applicationLabel} Team</p>
+      </div>
+    `,
+  };
+
+  try {
+    await transporter.verify();
+    const info = await transporter.sendMail(mailOptions);
+    console.log("[DemoAccessService] Invoice extractor registration email sent", {
+      messageId: info.messageId,
+      preview: nodemailer.getTestMessageUrl(info),
+    });
+    return true;
+  } catch (error) {
+    console.error(
+      "[DemoAccessService] Failed to send invoice extractor registration email:",
+      error
+    );
+    return false;
+  }
+}
+
 async function issueDemoAccessLink(
   payload: DemoRequestPayload,
   constraintsOverride?: ResolvedConstraints
@@ -1043,7 +1102,12 @@ export async function logDemoTokenAccessEvent(params: {
 export interface InvoiceExtractorAccessDecision {
   allowed: boolean;
   decision: "granted" | "denied";
-  reason: "within_limit" | "limit_reached" | "no_allowance";
+  reason:
+    | "within_limit"
+    | "limit_reached"
+    | "no_allowance"
+    | "not_registered"
+    | "application_mismatch";
   email: string;
   attemptCount: number;
   allowedAttempts: number;
@@ -1083,15 +1147,76 @@ export async function evaluateInvoiceExtractorAccess(
     normalizedEmail,
     INVOICE_EXTRACTOR_APPLICATION
   );
+  const demoRequest = await getDemoRequestByEmail(normalizedEmail);
+
+  if (!demoRequest) {
+    let notificationEmailSent = Boolean(usage?.registration_notified_at);
+
+    if (!notificationEmailSent) {
+      notificationEmailSent = await sendInvoiceExtractorRegistrationEmail(
+        normalizedEmail
+      );
+
+      if (notificationEmailSent) {
+        await markInvoiceExtractorRegistrationNotification(
+          normalizedEmail,
+          allowedAttempts,
+          INVOICE_EXTRACTOR_APPLICATION
+        );
+      }
+    } else if (usage) {
+      await markInvoiceExtractorRegistrationNotification(
+        normalizedEmail,
+        allowedAttempts,
+        INVOICE_EXTRACTOR_APPLICATION
+      );
+    }
+
+    return {
+      allowed: false,
+      decision: "denied",
+      reason: "not_registered",
+      email: normalizedEmail,
+      attemptCount: 0,
+      allowedAttempts,
+      remainingAttempts: allowedAttempts,
+      notificationEmailSent,
+    };
+  }
+
+  let recordApplication: string | null = null;
+
+  if (demoRequest.application) {
+    try {
+      recordApplication = normalizeApplication(demoRequest.application);
+    } catch (error) {
+      console.warn(
+        "[DemoAccessService] Invoice extractor demo request has unrecognized application value:",
+        demoRequest.application,
+        error
+      );
+      recordApplication = null;
+    }
+  }
+
+  if (recordApplication !== INVOICE_EXTRACTOR_APPLICATION) {
+    return {
+      allowed: false,
+      decision: "denied",
+      reason: "application_mismatch",
+      email: normalizedEmail,
+      attemptCount: 0,
+      allowedAttempts,
+      remainingAttempts: 0,
+      notificationEmailSent: false,
+    };
+  }
+
   const currentAttempts = usage?.attempt_count ?? 0;
   const expectedRemaining = Math.max(allowedAttempts - currentAttempts, 0);
-  let currentRemaining =
-    usage?.remaining_attempts ?? expectedRemaining;
+  let currentRemaining = usage?.remaining_attempts ?? expectedRemaining;
 
-  if (
-    usage &&
-    usage.remaining_attempts !== expectedRemaining
-  ) {
+  if (usage && usage.remaining_attempts !== expectedRemaining) {
     const synced = await syncInvoiceExtractorRemainingAttempts(
       normalizedEmail,
       allowedAttempts,
