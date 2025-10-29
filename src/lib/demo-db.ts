@@ -428,3 +428,174 @@ export async function insertDemoAccessLogEntry(payload: {
     client.release();
   }
 }
+
+export type InvoiceExtractorEmailUsageRow = {
+  id: number;
+  email: string;
+  application: string;
+  attempt_count: number;
+  remaining_attempts: number;
+  last_attempt_at: string;
+  limit_notified_at: string | null;
+  created_at: string;
+};
+
+export async function getInvoiceExtractorEmailUsage(
+  email: string,
+  application: string = 'invoiceextractor',
+): Promise<InvoiceExtractorEmailUsageRow | null> {
+  const activePool = requirePool();
+  const client = await activePool.connect();
+
+  try {
+    const result = await client.query<InvoiceExtractorEmailUsageRow>(
+      `SELECT
+         id,
+         email,
+         application,
+         attempt_count,
+         remaining_attempts,
+         last_attempt_at,
+         limit_notified_at,
+         created_at
+       FROM invoice_extractor_email_usage
+       WHERE email = $1 AND application = $2
+       LIMIT 1`,
+      [email, application],
+    );
+
+    return result.rows[0] ?? null;
+  } catch (error) {
+    if ((error as { code?: string })?.code === '42P01') {
+      console.error(
+        '[DemoAccessService] invoice_extractor_email_usage table not found. Please run the corresponding migration.',
+      );
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function incrementInvoiceExtractorEmailUsage(
+  email: string,
+  allowedAttempts: number,
+  application: string = 'invoiceextractor',
+): Promise<InvoiceExtractorEmailUsageRow> {
+  const activePool = requirePool();
+  const client = await activePool.connect();
+
+  try {
+    const result = await client.query<InvoiceExtractorEmailUsageRow>(
+      `INSERT INTO invoice_extractor_email_usage
+         (email, application, attempt_count, remaining_attempts, last_attempt_at)
+       VALUES ($1, $2, 1, GREATEST($3 - 1, 0), NOW())
+       ON CONFLICT (email, application)
+       DO UPDATE SET
+         attempt_count = invoice_extractor_email_usage.attempt_count + 1,
+         remaining_attempts = GREATEST($3 - (invoice_extractor_email_usage.attempt_count + 1), 0),
+         last_attempt_at = NOW()
+       RETURNING
+         id,
+         email,
+         application,
+         attempt_count,
+         remaining_attempts,
+         last_attempt_at,
+         limit_notified_at,
+         created_at`,
+      [email, application, Math.max(allowedAttempts, 0)],
+    );
+
+    return result.rows[0];
+  } catch (error) {
+    if ((error as { code?: string })?.code === '42P01') {
+      console.error(
+        '[DemoAccessService] invoice_extractor_email_usage table not found. Please run the corresponding migration.',
+      );
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function syncInvoiceExtractorRemainingAttempts(
+  email: string,
+  allowedAttempts: number,
+  application: string = 'invoiceextractor',
+): Promise<InvoiceExtractorEmailUsageRow | null> {
+  const activePool = requirePool();
+  const client = await activePool.connect();
+
+  try {
+    const result = await client.query<InvoiceExtractorEmailUsageRow>(
+      `UPDATE invoice_extractor_email_usage
+       SET remaining_attempts = GREATEST($3 - attempt_count, 0)
+       WHERE email = $1 AND application = $2
+       RETURNING
+         id,
+         email,
+         application,
+         attempt_count,
+         remaining_attempts,
+         last_attempt_at,
+         limit_notified_at,
+         created_at`,
+      [email, application, Math.max(allowedAttempts, 0)],
+    );
+
+    return result.rows[0] ?? null;
+  } catch (error) {
+    if ((error as { code?: string })?.code === '42P01') {
+      console.error(
+        '[DemoAccessService] invoice_extractor_email_usage table not found. Please run the corresponding migration.',
+      );
+      return null;
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function markInvoiceExtractorLimitNotification(
+  email: string,
+  allowedAttempts: number,
+  application: string = 'invoiceextractor',
+): Promise<void> {
+  const activePool = requirePool();
+  const client = await activePool.connect();
+
+  try {
+    const result = await client.query(
+      `UPDATE invoice_extractor_email_usage
+       SET
+         limit_notified_at = NOW(),
+         last_attempt_at = NOW(),
+         remaining_attempts = 0,
+         attempt_count = GREATEST(attempt_count, $3)
+       WHERE email = $1 AND application = $2`,
+      [email, application, Math.max(allowedAttempts, 0)],
+    );
+
+    if (result.rowCount === 0) {
+      await client.query(
+        `INSERT INTO invoice_extractor_email_usage
+           (email, application, attempt_count, remaining_attempts, last_attempt_at, limit_notified_at)
+         VALUES ($1, $2, $3, 0, NOW(), NOW())
+         ON CONFLICT (email, application) DO NOTHING`,
+        [email, application, Math.max(allowedAttempts, 0)],
+      );
+    }
+  } catch (error) {
+    if ((error as { code?: string })?.code === '42P01') {
+      console.error(
+        '[DemoAccessService] invoice_extractor_email_usage table not found. Please run the corresponding migration.',
+      );
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}

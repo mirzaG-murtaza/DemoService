@@ -9,6 +9,10 @@ import {
   updateDemoRequestProfile,
   insertDemoAccessLogEntry,
   getDemoConstraints,
+  getInvoiceExtractorEmailUsage,
+  incrementInvoiceExtractorEmailUsage,
+  syncInvoiceExtractorRemainingAttempts,
+  markInvoiceExtractorLimitNotification,
   type DemoRequestRow,
 } from "./lib/demo-db";
 
@@ -30,6 +34,7 @@ const ALLOWED_APPLICATIONS = (
 const APPLICATION_LABELS: Record<string, string> = {
   voicethru: "VoiceThru",
   invoiceextraction: "Invoice Extraction",
+  invoiceextractor: "Invoice Extractor",
 };
 
 const DEFAULT_APPLICATION = ALLOWED_APPLICATIONS[0] || "voicethru";
@@ -39,6 +44,8 @@ const DEFAULT_CONSTRAINTS = {
   conversationsAllowed: 3,
   tokenExpirySeconds: 7 * 24 * 60 * 60,
 } as const;
+
+const INVOICE_EXTRACTOR_APPLICATION = "invoiceextractor";
 
 const PERSONAL_EMAIL_DOMAINS = new Set<string>([
   "gmail.com",
@@ -462,6 +469,68 @@ async function sendDemoDuplicateNoticeEmail(
   } catch (error) {
     console.error(
       "[DemoAccessService] Failed to send duplicate demo notification email:",
+      error
+    );
+    return false;
+  }
+}
+
+async function sendInvoiceExtractorLimitEmail(
+  recipient: string,
+  allowedAttempts: number
+): Promise<boolean> {
+  const transporter = createEmailTransporter();
+
+  if (!transporter) {
+    console.warn(
+      "[DemoAccessService] Email transporter not configured; skipping invoice extractor limit notification."
+    );
+    return false;
+  }
+
+  const applicationLabel = getApplicationLabel(INVOICE_EXTRACTOR_APPLICATION);
+  const attemptsDescription =
+    allowedAttempts <= 0
+      ? "no remaining allowance"
+      : allowedAttempts === 1
+      ? "1 allowed attempt"
+      : `${allowedAttempts} allowed attempts`;
+
+  const mailOptions = {
+    from: EMAIL_FROM,
+    to: recipient,
+    subject: `${applicationLabel} Usage Limit Reached`,
+    text: [
+      `Hi there,`,
+      ``,
+      `You have reached the maximum number of invoice extractions permitted for this demo (${attemptsDescription}).`,
+      `Please contact our team if you need extended access or additional invoice extraction capacity.`,
+      ``,
+      `Regards,`,
+      `The ${applicationLabel} Team`,
+    ].join("\n"),
+    html: `
+      <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+        <h2>${applicationLabel} Usage Limit Reached</h2>
+        <p>Hi there,</p>
+        <p>You have reached the maximum number of invoice extractions permitted for this demo (${attemptsDescription}).</p>
+        <p>Please contact our team if you need extended access or additional invoice extraction capacity.</p>
+        <p>Regards,<br/>The ${applicationLabel} Team</p>
+      </div>
+    `,
+  };
+
+  try {
+    await transporter.verify();
+    const info = await transporter.sendMail(mailOptions);
+    console.log("[DemoAccessService] Invoice extractor limit email sent", {
+      messageId: info.messageId,
+      preview: nodemailer.getTestMessageUrl(info),
+    });
+    return true;
+  } catch (error) {
+    console.error(
+      "[DemoAccessService] Failed to send invoice extractor limit email:",
       error
     );
     return false;
@@ -969,4 +1038,125 @@ export async function logDemoTokenAccessEvent(params: {
       500
     );
   }
+}
+
+export interface InvoiceExtractorAccessDecision {
+  allowed: boolean;
+  decision: "granted" | "denied";
+  reason: "within_limit" | "limit_reached" | "no_allowance";
+  email: string;
+  attemptCount: number;
+  allowedAttempts: number;
+  remainingAttempts: number;
+  notificationEmailSent: boolean;
+}
+
+export async function evaluateInvoiceExtractorAccess(
+  rawEmail: string
+): Promise<InvoiceExtractorAccessDecision> {
+  if (typeof rawEmail !== "string" || rawEmail.trim().length === 0) {
+    throw new DemoAccessServiceError(
+      "invalid_email",
+      "An email address is required.",
+      400
+    );
+  }
+
+  const normalizedEmail = normalizeEmail(rawEmail);
+
+  if (!normalizedEmail.includes("@")) {
+    throw new DemoAccessServiceError(
+      "invalid_email",
+      "A valid email address is required.",
+      400
+    );
+  }
+
+  const constraints = await loadConstraints();
+  const allowedAttempts = Math.max(
+    Number.isFinite(constraints.conversationsAllowed)
+      ? constraints.conversationsAllowed
+      : DEFAULT_CONSTRAINTS.conversationsAllowed,
+    0
+  );
+  const usage = await getInvoiceExtractorEmailUsage(
+    normalizedEmail,
+    INVOICE_EXTRACTOR_APPLICATION
+  );
+  const currentAttempts = usage?.attempt_count ?? 0;
+  const expectedRemaining = Math.max(allowedAttempts - currentAttempts, 0);
+  let currentRemaining =
+    usage?.remaining_attempts ?? expectedRemaining;
+
+  if (
+    usage &&
+    usage.remaining_attempts !== expectedRemaining
+  ) {
+    const synced = await syncInvoiceExtractorRemainingAttempts(
+      normalizedEmail,
+      allowedAttempts,
+      INVOICE_EXTRACTOR_APPLICATION
+    );
+    if (synced) {
+      currentRemaining = synced.remaining_attempts;
+    } else {
+      currentRemaining = expectedRemaining;
+    }
+  }
+
+  if (allowedAttempts === 0 || currentRemaining <= 0) {
+    let notificationEmailSent = Boolean(usage?.limit_notified_at);
+
+    if (!notificationEmailSent) {
+      notificationEmailSent = await sendInvoiceExtractorLimitEmail(
+        normalizedEmail,
+        allowedAttempts
+      );
+
+      if (notificationEmailSent) {
+        await markInvoiceExtractorLimitNotification(
+          normalizedEmail,
+          allowedAttempts,
+          INVOICE_EXTRACTOR_APPLICATION
+        );
+      }
+    } else {
+      await markInvoiceExtractorLimitNotification(
+        normalizedEmail,
+        allowedAttempts,
+        INVOICE_EXTRACTOR_APPLICATION
+      );
+    }
+
+    return {
+      allowed: false,
+      decision: "denied",
+      reason:
+        allowedAttempts === 0 ? "no_allowance" : "limit_reached",
+      email: normalizedEmail,
+      attemptCount: currentAttempts,
+      allowedAttempts,
+      remainingAttempts: 0,
+      notificationEmailSent,
+    };
+  }
+
+  const updatedUsage = await incrementInvoiceExtractorEmailUsage(
+    normalizedEmail,
+    allowedAttempts,
+    INVOICE_EXTRACTOR_APPLICATION
+  );
+  const attemptCount = updatedUsage.attempt_count;
+  const remainingAttempts = updatedUsage.remaining_attempts;
+
+  return {
+    allowed: true,
+    decision: "granted",
+    reason: "within_limit",
+    email: normalizedEmail,
+    attemptCount,
+    allowedAttempts,
+    remainingAttempts,
+    notificationEmailSent: false,
+  };
 }
